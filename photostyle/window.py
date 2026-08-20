@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from PIL.ImageQt import ImageQt
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
@@ -49,12 +50,17 @@ QScrollArea { border: 0; background: transparent; }
 
 
 class PreviewCanvas(QFrame):
+    crop_moved = Signal(float, float)
+
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("canvas")
         self.setMinimumSize(560, 420)
         self._pixmap: QPixmap | None = None
         self.guide = "无"
+        self.crop_ratio: tuple[int, int] | None = None
+        self.crop_anchor = (0.5, 0.5)
+        self._drag_offset = None
 
     def set_image(self, image) -> None:
         qimage = QImage(ImageQt(image))
@@ -72,6 +78,20 @@ class PreviewCanvas(QFrame):
         x, y = (self.width() - scaled.width()) // 2, (self.height() - scaled.height()) // 2
         return x, y, scaled.width(), scaled.height()
 
+    def crop_rect(self) -> QRectF | None:
+        image = self.image_rect()
+        if not image or not self.crop_ratio:
+            return None
+        x, y, width, height = image
+        target = self.crop_ratio[0] / self.crop_ratio[1]
+        if width / height > target:
+            crop_height, crop_width = height, height * target
+        else:
+            crop_width, crop_height = width, width / target
+        left = x + (width - crop_width) * self.crop_anchor[0]
+        top = y + (height - crop_height) * self.crop_anchor[1]
+        return QRectF(left, top, crop_width, crop_height)
+
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
         painter = QPainter(self)
@@ -83,22 +103,71 @@ class PreviewCanvas(QFrame):
             return
         x, y, w, h = rect
         painter.drawPixmap(x, y, w, h, self._pixmap)
+        crop = self.crop_rect()
+        if crop:
+            shade = QColor(0, 0, 0, 145)
+            image = QRectF(x, y, w, h)
+            painter.fillRect(QRectF(image.left(), image.top(), image.width(), crop.top() - image.top()), shade)
+            painter.fillRect(QRectF(image.left(), crop.bottom(), image.width(), image.bottom() - crop.bottom()), shade)
+            painter.fillRect(QRectF(image.left(), crop.top(), crop.left() - image.left(), crop.height()), shade)
+            painter.fillRect(QRectF(crop.right(), crop.top(), image.right() - crop.right(), crop.height()), shade)
+            painter.setPen(QPen(QColor("#c8ff71"), 2))
+            painter.drawRect(crop)
+
+        guide_area = crop if crop else QRectF(x, y, w, h)
         if self.guide == "无":
             return
-        painter.setPen(QPen(QColor(255, 255, 255, 185), 1))
+        painter.setPen(QPen(QColor(255, 255, 255, 200), 1))
         vertical, horizontal = [], []
         if self.guide == "三分线":
             vertical, horizontal = [1 / 3, 2 / 3], [1 / 3, 2 / 3]
         elif self.guide == "黄金分割":
-            vertical, horizontal = [0.382, 0.618], [0.382, 0.618]
+            golden = (3 - math.sqrt(5)) / 2
+            vertical, horizontal = [golden, 1 - golden], [golden, 1 - golden]
         elif self.guide == "方格线":
             vertical = horizontal = [i / 6 for i in range(1, 6)]
         elif self.guide == "中心十字":
             vertical, horizontal = [0.5], [0.5]
         for position in vertical:
-            painter.drawLine(round(x + w * position), y, round(x + w * position), y + h)
+            line_x = round(guide_area.left() + guide_area.width() * position)
+            painter.drawLine(line_x, round(guide_area.top()), line_x, round(guide_area.bottom()))
         for position in horizontal:
-            painter.drawLine(x, round(y + h * position), x + w, round(y + h * position))
+            line_y = round(guide_area.top() + guide_area.height() * position)
+            painter.drawLine(round(guide_area.left()), line_y, round(guide_area.right()), line_y)
+
+    def mousePressEvent(self, event) -> None:
+        crop = self.crop_rect()
+        if event.button() == Qt.LeftButton and crop and crop.contains(event.position()):
+            self._drag_offset = event.position() - crop.topLeft()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_offset is None:
+            super().mouseMoveEvent(event)
+            return
+        image = self.image_rect()
+        crop = self.crop_rect()
+        if not image or not crop:
+            return
+        x, y, width, height = image
+        desired = event.position() - self._drag_offset
+        travel_x, travel_y = width - crop.width(), height - crop.height()
+        anchor_x = 0.5 if travel_x <= 0 else (desired.x() - x) / travel_x
+        anchor_y = 0.5 if travel_y <= 0 else (desired.y() - y) / travel_y
+        self.crop_anchor = (max(0.0, min(1.0, anchor_x)), max(0.0, min(1.0, anchor_y)))
+        self.crop_moved.emit(*self.crop_anchor)
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self._drag_offset is not None:
+            self._drag_offset = None
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -112,7 +181,7 @@ class EditorWindow(QMainWindow):
         super().__init__()
         self.documents: list[PhotoDocument] = []
         self.current_index = -1
-        self.setWindowTitle("拾光 · PhotoStyle Editor")
+        self.setWindowTitle("PhotoStyle Editor")
         self.resize(1440, 900)
         self.setMinimumSize(1080, 700)
         self.setAcceptDrops(True)
@@ -129,18 +198,18 @@ class EditorWindow(QMainWindow):
         outer = QVBoxLayout(root); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
         topbar = QFrame(objectName="topbar"); topbar.setFixedHeight(70)
         top = QHBoxLayout(topbar); top.setContentsMargins(20, 12, 20, 12)
-        mark = QLabel("拾", objectName="brandMark"); brand = QLabel("拾光  PhotoStyle", objectName="brand")
-        top.addWidget(mark); top.addWidget(brand); top.addStretch()
+        brand = QLabel("PhotoStyle", objectName="brand")
+        top.addWidget(brand); top.addStretch()
         self.batch_button = QPushButton("批量导出"); self.batch_button.clicked.connect(self.export_batch)
-        import_button = QPushButton("＋  导入照片", objectName="primary"); import_button.clicked.connect(self.choose_files)
+        import_button = QPushButton("导入照片", objectName="primary"); import_button.clicked.connect(self.choose_files)
         top.addWidget(self.batch_button); top.addWidget(import_button); outer.addWidget(topbar)
         content = QHBoxLayout(); content.setContentsMargins(0, 0, 0, 0); content.setSpacing(0)
         content.addWidget(self._build_library())
         center = QWidget(); center_layout = QVBoxLayout(center); center_layout.setContentsMargins(22, 18, 22, 16)
         crumb = QHBoxLayout(); self.filename = QLabel("未选择照片", objectName="section"); self.dimensions = QLabel("", objectName="meta")
         crumb.addWidget(self.filename); crumb.addStretch(); crumb.addWidget(self.dimensions); center_layout.addLayout(crumb)
-        self.canvas = PreviewCanvas(); center_layout.addWidget(self.canvas, 1)
-        tip = QLabel("预览参考线不会写入导出图片", objectName="muted"); tip.setAlignment(Qt.AlignCenter); center_layout.addWidget(tip)
+        self.canvas = PreviewCanvas(); self.canvas.crop_moved.connect(self.move_crop); center_layout.addWidget(self.canvas, 1)
+        tip = QLabel("参考线不会写入图片；拖动裁剪框可调整取景", objectName="muted"); tip.setAlignment(Qt.AlignCenter); center_layout.addWidget(tip)
         content.addWidget(center, 1); content.addWidget(self._build_inspector()); outer.addLayout(content, 1)
         self.setCentralWidget(root); self.setStatusBar(QStatusBar()); self.statusBar().showMessage("就绪 · 支持拖放导入")
 
@@ -150,7 +219,7 @@ class EditorWindow(QMainWindow):
         title = QLabel("照片库", objectName="section"); self.count_label = QLabel("0 张照片", objectName="muted")
         layout.addWidget(title); layout.addWidget(self.count_label)
         self.library = QListWidget(); self.library.currentRowChanged.connect(self.select_document); layout.addWidget(self.library, 1)
-        add = QPushButton("＋  继续添加"); add.clicked.connect(self.choose_files); layout.addWidget(add)
+        add = QPushButton("继续添加"); add.clicked.connect(self.choose_files); layout.addWidget(add)
         return panel
 
     def _build_inspector(self) -> QWidget:
@@ -160,14 +229,14 @@ class EditorWindow(QMainWindow):
         layout.addWidget(QLabel("风格滤镜", objectName="section"))
         self.filter_group = QButtonGroup(self); self.filter_group.setExclusive(True); self.filter_buttons = []
         for preset in FILTERS:
-            button = QPushButton(f"●  {preset.name}    {preset.description}", objectName="filter"); button.setCheckable(True)
+            button = QPushButton(preset.name, objectName="filter"); button.setCheckable(True)
             button.setProperty("filter_key", preset.key); button.clicked.connect(self.change_filter); self.filter_group.addButton(button); self.filter_buttons.append(button); layout.addWidget(button)
         self.filter_buttons[0].setChecked(True)
         row = QHBoxLayout(); row.addWidget(QLabel("滤镜强度", objectName="section")); row.addStretch(); self.intensity_value = QLabel("70%", objectName="meta"); row.addWidget(self.intensity_value); layout.addLayout(row)
         self.intensity = QSlider(Qt.Horizontal); self.intensity.setRange(0, 100); self.intensity.setValue(70); self.intensity.valueChanged.connect(self.change_intensity); layout.addWidget(self.intensity)
         layout.addSpacing(8); layout.addWidget(QLabel("构图参考线", objectName="section")); self.guide = QComboBox(); self.guide.addItems(["无", "三分线", "黄金分割", "方格线", "中心十字"]); self.guide.currentTextChanged.connect(self.change_guide); layout.addWidget(self.guide)
-        layout.addSpacing(8); layout.addWidget(QLabel("裁剪比例", objectName="section")); self.ratio = QComboBox(); self.ratio.addItems(RATIOS); layout.addWidget(self.ratio)
-        self.crop_button = QPushButton("应用居中裁剪"); self.crop_button.clicked.connect(self.apply_crop); layout.addWidget(self.crop_button)
+        layout.addSpacing(8); layout.addWidget(QLabel("裁剪比例", objectName="section")); self.ratio = QComboBox(); self.ratio.addItems(RATIOS); self.ratio.currentTextChanged.connect(self.preview_crop); layout.addWidget(self.ratio)
+        self.crop_button = QPushButton("应用裁剪"); self.crop_button.clicked.connect(self.apply_crop); layout.addWidget(self.crop_button)
         layout.addSpacing(8); self.export_button = QPushButton("导出当前 PNG", objectName="primary"); self.export_button.clicked.connect(self.export_current); layout.addWidget(self.export_button); layout.addStretch()
         scroll.setWidget(body); wrapper = QVBoxLayout(panel); wrapper.setContentsMargins(0, 0, 0, 0); wrapper.addWidget(scroll); return panel
 
@@ -198,10 +267,17 @@ class EditorWindow(QMainWindow):
         self.filename.setText(doc.path.name); self.dimensions.setText(f"{doc.original.width} × {doc.original.height}  ·  RGB")
         self.intensity.blockSignals(True); self.intensity.setValue(doc.intensity); self.intensity.blockSignals(False); self.intensity_value.setText(f"{doc.intensity}%")
         for button in self.filter_buttons: button.setChecked(button.property("filter_key") == doc.filter_key)
+        self.ratio.blockSignals(True); self.ratio.setCurrentText(next((name for name, ratio in RATIOS.items() if ratio == doc.crop_ratio), "自由 / 原始")); self.ratio.blockSignals(False)
+        self.canvas.crop_ratio = None
         self.refresh_preview()
 
     def refresh_preview(self) -> None:
-        if self.current: self.canvas.set_image(self.current.render((1200, 900)))
+        if not self.current:
+            return
+        if self.canvas.crop_ratio:
+            self.canvas.set_image(self.current.render_uncropped((1200, 900)))
+        else:
+            self.canvas.set_image(self.current.render((1200, 900)))
 
     def change_filter(self) -> None:
         if not self.current: return
@@ -214,8 +290,23 @@ class EditorWindow(QMainWindow):
     def change_guide(self, value: str) -> None:
         self.canvas.guide = value; self.canvas.update()
 
+    def preview_crop(self, value: str) -> None:
+        if not self.current:
+            return
+        self.canvas.crop_ratio = RATIOS[value]
+        self.canvas.crop_anchor = self.current.crop_anchor
+        self.canvas.set_image(self.current.render_uncropped((1200, 900)))
+
+    def move_crop(self, x: float, y: float) -> None:
+        self.statusBar().showMessage("正在调整裁剪位置", 1000)
+
     def apply_crop(self) -> None:
-        if self.current: self.current.crop_ratio = RATIOS[self.ratio.currentText()]; self.refresh_preview(); self.statusBar().showMessage("已应用非破坏性裁剪", 2500)
+        if self.current:
+            self.current.crop_ratio = RATIOS[self.ratio.currentText()]
+            self.current.crop_anchor = self.canvas.crop_anchor
+            self.canvas.crop_ratio = None
+            self.refresh_preview()
+            self.statusBar().showMessage("已应用非破坏性裁剪", 2500)
 
     def export_current(self) -> None:
         if not self.current: return
