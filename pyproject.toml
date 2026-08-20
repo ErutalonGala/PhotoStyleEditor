@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photostyle-editor"
+version = "0.1.0"
+description = "A modern batch photo style editor"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["Pillow>=10.2", "PySide6>=6.6", "rawpy>=0.19"]
+
+[project.scripts]
+photostyle = "photostyle.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["photostyle*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
