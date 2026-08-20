@@ -96,21 +96,36 @@ def load_image(path: str | Path) -> Image.Image:
         return ImageOps.exif_transpose(source).convert("RGB")
 
 
-def centered_crop(image: Image.Image, ratio: tuple[int, int] | None) -> Image.Image:
-    """Crop the largest centered rectangle matching *ratio*."""
+def ratio_crop(
+    image: Image.Image,
+    ratio: tuple[int, int] | None,
+    anchor: tuple[float, float] = (0.5, 0.5),
+) -> Image.Image:
+    """Crop to *ratio*, positioning the crop within the spare space by *anchor*.
+
+    Each anchor component is normalized from 0 (top/left) to 1 (bottom/right).
+    Values outside that range are clamped so a crop can never leave the image.
+    """
     if ratio is None:
         return image.copy()
     target = ratio[0] / ratio[1]
     width, height = image.size
+    anchor_x = max(0.0, min(1.0, anchor[0]))
+    anchor_y = max(0.0, min(1.0, anchor[1]))
     if width / height > target:
         crop_width = round(height * target)
-        left = (width - crop_width) // 2
+        left = round((width - crop_width) * anchor_x)
         box = (left, 0, left + crop_width, height)
     else:
         crop_height = round(width / target)
-        top = (height - crop_height) // 2
+        top = round((height - crop_height) * anchor_y)
         box = (0, top, width, top + crop_height)
     return image.crop(box)
+
+
+def centered_crop(image: Image.Image, ratio: tuple[int, int] | None) -> Image.Image:
+    """Crop the largest centered rectangle matching *ratio*."""
+    return ratio_crop(image, ratio)
 
 
 def apply_filter(image: Image.Image, key: str, intensity: int) -> Image.Image:
@@ -130,6 +145,7 @@ class PhotoDocument:
     filter_key: str = "original"
     intensity: int = 70
     crop_ratio: tuple[int, int] | None = None
+    crop_anchor: tuple[float, float] = (0.5, 0.5)
     _preview_cache: dict[tuple, Image.Image] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -137,14 +153,21 @@ class PhotoDocument:
         return cls(Path(path), load_image(path))
 
     def render(self, max_size: tuple[int, int] | None = None) -> Image.Image:
-        key = (self.filter_key, self.intensity, self.crop_ratio, max_size)
+        key = (self.filter_key, self.intensity, self.crop_ratio, self.crop_anchor, max_size)
         if key not in self._preview_cache:
-            result = centered_crop(self.original, self.crop_ratio)
+            result = ratio_crop(self.original, self.crop_ratio, self.crop_anchor)
             result = apply_filter(result, self.filter_key, self.intensity)
             if max_size:
                 result.thumbnail(max_size, Image.Resampling.LANCZOS)
             self._preview_cache[key] = result
         return self._preview_cache[key].copy()
+
+    def render_uncropped(self, max_size: tuple[int, int] | None = None) -> Image.Image:
+        """Render filters without the committed crop for an interactive crop preview."""
+        result = apply_filter(self.original, self.filter_key, self.intensity)
+        if max_size:
+            result.thumbnail(max_size, Image.Resampling.LANCZOS)
+        return result
 
     def export_png(self, destination: str | Path) -> Path:
         destination = Path(destination).with_suffix(".png")
